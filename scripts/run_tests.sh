@@ -3,7 +3,9 @@
 # `pytest` directly to guarantee your local run matches CI behavior.
 #
 # What this script enforces:
-#   * -n 4 xdist workers (CI has 4 cores; -n auto diverges locally)
+#   * `-n auto` xdist workers (the in-tree isolate plugin forks each test
+#     into its own subprocess, so state-leakage flakes that forced us to
+#     cap at 4 are gone)
 #   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
 #   * Credential env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running `pytest` outside of
@@ -104,10 +106,11 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
 fi
 
 # ── Worker count ────────────────────────────────────────────────────────────
-# CI uses `-n auto` on ubuntu-latest which gives 4 workers. A 20-core
-# workstation with `-n auto` gets 20 workers and exposes test-ordering
-# flakes that CI will never see. Pin to 4 so local matches CI.
-WORKERS="${HERMES_TEST_WORKERS:-4}"
+# Each test runs in its own spawned subprocess (see tests/_isolate_plugin.py),
+# so module-level state cannot leak between tests on the same xdist worker.
+# Safe to use `-n auto` — big workstations now get parallelism proportional
+# to their core count.
+WORKERS="${HERMES_TEST_WORKERS:-auto}"
 
 # ── Run pytest ──────────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
@@ -119,12 +122,15 @@ ARGS=("$@")
 echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
 
-# -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
-# We re-add --timeout/--timeout-method here because pyproject.toml's
-# addopts is wiped above. The 60s cap is essential: see pyproject.toml
-# for why (suite deadlocks at session teardown without it).
+# -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins. We re-add:
+#   * `-p tests._isolate_plugin` — clearing addopts drops the isolation
+#     plugin registration from pyproject.toml.
+#   * `--timeout` / `--timeout-method` — belt-and-suspenders alongside
+#     subprocess isolation. See pyproject.toml comment for why; without
+#     these the suite can deadlock at session teardown on full runs.
 exec "$PYTHON" -m pytest \
   -o "addopts=" \
+  -p tests._isolate_plugin \
   -n "$WORKERS" \
   --timeout=30 \
   --timeout-method=signal \
