@@ -25,6 +25,12 @@ jobs:
     runs-on: arc-runner-set
     timeout-minutes: 30
     steps:
+      - name: Install CI dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3 python3-pip python3-venv golang shellcheck make helm curl wget jq
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | sudo tar xz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/kustomize
+          pip3 install --break-system-packages pytest pyyaml requests
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -57,6 +63,12 @@ jobs:
     runs-on: arc-runner-set
     timeout-minutes: 15
     steps:
+      - name: Install CI dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3 python3-pip python3-venv golang shellcheck make helm curl wget jq
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | sudo tar xz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/kustomize
+          pip3 install --break-system-packages pytest pyyaml requests
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
