@@ -48,7 +48,7 @@ jobs:
   build-amd64:
     # Only run on the upstream repository, not on forks
     if: github.repository == 'NousResearch/hermes-agent'
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 45
     outputs:
       digest: ${{ steps.push.outputs.digest }}
@@ -213,7 +213,7 @@ jobs:
   # ---------------------------------------------------------------------------
   merge:
     if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release')
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     needs: [build-amd64, build-arm64]
     timeout-minutes: 10
     outputs:
@@ -317,7 +317,7 @@ jobs:
       && github.ref == 'refs/heads/main'
       && needs.merge.outputs.pushed_sha_tag == 'true'
     needs: merge
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 10
     concurrency:
       group: docker-move-main-${{ github.ref }}
@@ -438,7 +438,7 @@ jobs:
       && github.event_name == 'release'
       && needs.merge.outputs.pushed_release_tag == 'true'
     needs: merge
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 10
     concurrency:
       group: docker-move-latest
