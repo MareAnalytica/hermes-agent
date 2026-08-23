@@ -67,7 +67,7 @@ concurrency:
 jobs:
   check:
     name: uv lock --check
-    runs-on: arc-runner-set
+    runs-on: liquidmetal
     timeout-minutes: 5
     steps:
       - name: Checkout code

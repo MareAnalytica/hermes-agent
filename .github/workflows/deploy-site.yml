@@ -23,14 +23,14 @@ concurrency:
 jobs:
   deploy-vercel:
     if: github.event_name == 'release'
-    runs-on: arc-runner-set
+    runs-on: liquidmetal
     steps:
       - name: Trigger Vercel Deploy
         run: curl -X POST "${{ secrets.VERCEL_DEPLOY_HOOK }}"
 
   deploy-docs:
     if: github.repository == 'NousResearch/hermes-agent'
-    runs-on: arc-runner-set
+    runs-on: liquidmetal
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
