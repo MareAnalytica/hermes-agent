@@ -1,0 +1,60 @@
+# Build on the in-cluster ARC runners and push to Harbor over the internal
+# network. CI never holds cluster credentials — ArgoCD pulls from the gitops
+# repo, and promotion to prod is the `promote` job plus a gitops PR.
+#
+# This mirrors JoveCapital/template-service ci.yml, which is the pattern this
+# estate is being rebuilt to match.
+name: harbor
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      promote_sha:
+        description: "Image tag to copy mare-dev -> mare-prod"
+        required: false
+
+env:
+  REGISTRY: harbor.dev.mareanalytica.com
+  IMAGE_NAME: hermes-agent
+
+jobs:
+  build:
+    if: github.event_name == 'push'
+    runs-on: liquidmetal-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_CI_USERNAME }}
+          password: ${{ secrets.HARBOR_CI_PASSWORD }}
+      # Plain docker build/push, no buildx. On Jove this was proven live: the
+      # classic push path honours the daemon's /etc/docker/certs.d trust for the
+      # internal CA, while buildkit's own token fetch ignores it and dies x509.
+      - name: build and push
+        run: |
+          IMAGE=$REGISTRY/mare-dev/$IMAGE_NAME
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+
+  # Promotion copies the EXACT artifact into mare-prod - no rebuild, so what was
+  # tested is what ships. mare-dev has a nightly retention job that keeps only
+  # the 2 most recent tags; mare-prod has none, so what lands there stays.
+  promote:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.promote_sha != ''
+    runs-on: liquidmetal-dev
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_CI_USERNAME }}
+          password: ${{ secrets.HARBOR_CI_PASSWORD }}
+      - name: copy image dev -> prod
+        run: |
+          SRC=$REGISTRY/mare-dev/$IMAGE_NAME:${{ github.event.inputs.promote_sha }}
+          DST=$REGISTRY/mare-prod/$IMAGE_NAME:${{ github.event.inputs.promote_sha }}
+          docker pull "$SRC"
+          docker tag  "$SRC" "$DST"
+          docker push "$DST"
