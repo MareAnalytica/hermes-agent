@@ -15,13 +15,13 @@ on:
         required: false
 
 env:
-  REGISTRY: harbor.dev.mareanalytica.com
+  REGISTRY: harbor.mareanalytica.com
   IMAGE_NAME: hermes-agent
 
 jobs:
   build:
     if: github.event_name == 'push'
-    runs-on: liquidmetal-dev
+    runs-on: liquidmetal
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -44,7 +44,7 @@ jobs:
   # the 2 most recent tags; mare-prod has none, so what lands there stays.
   promote:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.promote_sha != ''
-    runs-on: liquidmetal-dev
+    runs-on: liquidmetal
     steps:
       - uses: docker/login-action@v3
         with:
