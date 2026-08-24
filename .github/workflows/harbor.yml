@@ -15,7 +15,7 @@ on:
         required: false
 
 env:
-  REGISTRY: harbor.mareanalytica.com
+  REGISTRY: registry.mareanalytica.com
   IMAGE_NAME: hermes-agent
 
 jobs:
