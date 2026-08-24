@@ -153,9 +153,9 @@ jobs:
           echo "digests=${OUT}" >> "$GITHUB_OUTPUT"
 
   # NO PIN JOB, deliberately. This service's ArgoCD Application reads
-  # MareAnalytica/gitops platform/hermes/dev, a path owned elsewhere, so the dev
-  # pin is out of scope for this repo. The :dev and :latest refs still move, so
-  # the existing manifests keep working - the release simply does not roll by
-  # itself until that path grows an images: pin block and this repo is given a
+  # MareAnalytica/gitops platform/hermes/dev, a path owned elsewhere, so the dev pin is
+  # out of scope for this repo. The :dev and :latest refs still move, so the
+  # existing manifests keep working - the release simply does not roll by itself
+  # until that path grows an images: pin block and this repo is given a
   # GITOPS_DEPLOY_KEY. See MareAnalytica/gitops docs/DEPLOY-STRATEGY.md
   # section 6.
