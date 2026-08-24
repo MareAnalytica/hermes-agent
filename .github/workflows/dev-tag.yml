@@ -1,0 +1,161 @@
+# Dev release lane.
+#
+# Spec: MareAnalytica/gitops docs/DEPLOY-STRATEGY.md
+#
+#   git tag vX.Y.Z-dev.N
+#     -> build -> registry.mareanalytica.com/mare-dev -> pin -> ArgoCD auto-syncs = deployed
+#
+# Modelled on the Aflabox estate (qboxx/ironbox
+# docs/plans/2026-07-28-gitops-reimage/03-ci-tags-release-promotion.md, board
+# resolution 2026-07-28): the tag suffix IS the routing, the trigger filter is
+# an anchored whole-ref glob, and validate-tag re-checks the grammar inside the
+# job as defence in depth if that filter is ever loosened.
+#
+# NO CLUSTER CREDENTIALS LIVE HERE, and none may be added. There is no kubectl.
+# ArgoCD pulls the pinned desired state out of git; a kubectl step here would
+# simply fail, which is the guard rail rather than an oversight.
+#
+# Branch pushes deliberately build NOTHING (plan 03 section 3.4). Here that is
+# also forced by Harbor retention: mare-dev keeps only the 2 most recent
+# artifacts per image, so a branch-push build lane would evict the
+# :dev-<sha12> artifact that a later vX.Y.Z tag has to promote.
+
+name: dev tag
+
+"on":
+  push:
+    tags:
+      # Anchored whole-ref match: cannot match a bare vX.Y.Z, -stg.N or -rc.N.
+      - "v[0-9]+.[0-9]+.[0-9]+-dev.[0-9]+"
+
+concurrency:
+  group: dev-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # registry.mareanalytica.com is the docker/kubelet endpoint. Never
+  # harbor.mareanalytica.com - that is the human UI, behind Cloudflare Access.
+  REGISTRY: registry.mareanalytica.com
+  PROJECT: mare-dev
+
+jobs:
+  validate-tag:
+    name: validate the dev tag grammar
+    runs-on: liquidmetal
+    steps:
+      - name: Enforce vX.Y.Z-dev.N
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "${TAG}" in
+            *_*)
+              echo "::error::${TAG}: underscores are not part of the tag grammar"
+              exit 1 ;;
+            *-stg.*|*-staging.*)
+              echo "::error::${TAG}: this estate has no staging lane; dev tags are vX.Y.Z-dev.N"
+              exit 1 ;;
+            *-rc.*)
+              echo "::error::${TAG}: -rc.N is retired estate-wide; dev tags are vX.Y.Z-dev.N"
+              exit 1 ;;
+          esac
+          printf '%s' "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$' || {
+            echo "::error::${TAG} is not a dev tag (expected vX.Y.Z-dev.N)"
+            exit 1
+          }
+          echo "dev tag accepted: ${TAG}"
+
+  build:
+    name: build and push to mare-dev
+    needs: validate-tag
+    runs-on: liquidmetal
+    permissions:
+      contents: read
+    outputs:
+      digests: ${{ steps.push.outputs.digests }}
+      sha12: ${{ steps.push.outputs.sha12 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ARC runner's docker daemon is a sidecar and is not always up when the
+      # job starts.
+      - name: Wait for the docker daemon
+        run: |
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker info >/dev/null 2>&1 || { echo "::error::docker daemon never came up"; exit 1; }
+
+      # HARBOR_CI_USERNAME / HARBOR_CI_PASSWORD are PER-REPO secrets. This org is
+      # on the GitHub Free plan, where org-level Actions secrets are invisible to
+      # private repositories. docker login takes the bare registry host, never
+      # the project path.
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_CI_USERNAME }}
+          password: ${{ secrets.HARBOR_CI_PASSWORD }}
+
+      # Classic docker build + docker push ONLY - never buildx, never
+      # build-push-action. The classic CLI path honours the daemon's registry
+      # trust; buildkit's own token fetch ignores it and dies x509. Proven live
+      # on Jove, and re-proven here by every harbor.yml lane this replaces.
+      - name: Build and push
+        id: push
+        env:
+          IMAGES: |
+            [
+              {
+                "name": "hermes-agent",
+                "context": ".",
+                "dockerfile": "./Dockerfile"
+              }
+            ]
+        run: |
+          set -euo pipefail
+          SHA12="${GITHUB_SHA:0:12}"
+          REL="${GITHUB_REF_NAME}"
+          OUT="{}"
+          COUNT="$(printf '%s' "${IMAGES}" | jq 'length')"
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].name")"
+            CTX="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].context")"
+            DF="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].dockerfile")"
+            IMG="${REGISTRY}/${PROJECT}/${NAME}"
+
+            echo "=== ${NAME} -> ${IMG}"
+            # Four refs, one artifact:
+            #   :dev            moves, what a human reads
+            #   :dev-<sha12>    never moves; what promotion copies and what you roll back to
+            #   :<git tag>      never moves; traces the artifact back to its release
+            #   :latest         COMPATIBILITY ALIAS for manifests that still say latest
+            #                   (platform/hermes, platform/postiz, platform/cheesecake).
+            #                   Never pin to it.
+            docker build \
+              -t "${IMG}:dev" \
+              -t "${IMG}:dev-${SHA12}" \
+              -t "${IMG}:${REL}" \
+              -t "${IMG}:latest" \
+              -f "${DF}" "${CTX}"
+
+            for T in dev "dev-${SHA12}" "${REL}" latest; do
+              docker push "${IMG}:${T}"
+            done
+
+            D="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG}:dev" | cut -d@ -f2)"
+            OUT="$(printf '%s' "${OUT}" | jq -c --arg k "${NAME}" --arg v "${D}" '. + {($k): $v}')"
+            echo "- \`${NAME}\` -> \`${D}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "sha12=${SHA12}" >> "$GITHUB_OUTPUT"
+          echo "digests=${OUT}" >> "$GITHUB_OUTPUT"
+
+  # NO PIN JOB, deliberately. This service's ArgoCD Application reads
+  # MareAnalytica/gitops platform/hermes/dev, a path owned elsewhere, so the dev
+  # pin is out of scope for this repo. The :dev and :latest refs still move, so
+  # the existing manifests keep working - the release simply does not roll by
+  # itself until that path grows an images: pin block and this repo is given a
+  # GITOPS_DEPLOY_KEY. See MareAnalytica/gitops docs/DEPLOY-STRATEGY.md
+  # section 6.
