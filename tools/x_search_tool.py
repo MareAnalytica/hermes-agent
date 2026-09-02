@@ -11,12 +11,33 @@ The tool registers when **either** xAI credential path is available:
   i.e. ``hermes auth add xai-oauth`` has been run and the stored refresh
   token still works.
 
-Credential preference at call time matches
-:func:`tools.xai_http.resolve_xai_http_credentials`: SuperGrok OAuth first,
-direct OAuth resolver second, ``XAI_API_KEY`` last. That helper also
-auto-refreshes the OAuth access token when it's within the refresh skew
-window, so a ``True`` from :func:`check_x_search_requirements` means the
-bearer is fetchable AND non-empty.
+Credential preference at call time uses
+:func:`tools.xai_http.resolve_xai_http_credentials` with
+``prefer_api_key=True``: an explicit ``XAI_API_KEY`` wins when configured
+(x_search is API-metered; the subscription OAuth bearer answers
+``/v1/responses`` in a degraded no-citation mode — #88040), with SuperGrok
+OAuth as the fallback. That helper also auto-refreshes the OAuth access
+token when it's within the refresh skew window, so a ``True`` from
+:func:`check_x_search_requirements` means the bearer is fetchable AND
+non-empty.
+
+Defensive output
+----------------
+The tool surfaces two additional signals beyond xAI's raw response so callers
+can tell a real citation-backed answer from an unsourced one:
+
+* ``from_date`` / ``to_date`` are validated client-side before the HTTP call.
+  Malformed (non ``YYYY-MM-DD``), inverted (``from_date > to_date``), and
+  pure-future ranges (``from_date`` later than today UTC) fail fast with a
+  clear error instead of burning an API call. ``to_date`` in the future is
+  still allowed so callers can legitimately request "from yesterday to
+  tomorrow".
+* Successful responses carry ``degraded`` and ``degraded_reason`` fields.
+  ``degraded`` is ``True`` when any narrowing filter (handles or dates) was
+  active AND xAI returned no citations in either the top-level ``citations``
+  array or the inline ``url_citation`` annotations. In that case the
+  ``answer`` came from the model's own knowledge rather than the X index,
+  and the caller should treat the result as unsourced.
 
 Salvaged from PR #10786 (originally by @Jaaneek); credential resolution
 reworked to honor both auth modes per Teknium's design.
@@ -26,8 +47,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -38,9 +59,10 @@ from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
 logger = logging.getLogger(__name__)
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
+DEFAULT_X_SEARCH_MODEL = "grok-4.5"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
 DEFAULT_X_SEARCH_RETRIES = 2
+X_SEARCH_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 MAX_HANDLES = 10
 
 
@@ -60,6 +82,22 @@ def _load_x_search_config() -> Dict[str, Any]:
 def _get_x_search_model() -> str:
     cfg = _load_x_search_config()
     return (str(cfg.get("model") or "").strip() or DEFAULT_X_SEARCH_MODEL)
+
+
+def _get_x_search_reasoning_effort() -> Optional[str]:
+    cfg = _load_x_search_config()
+    raw_value = cfg.get("reasoning_effort")
+    if raw_value is None or not str(raw_value).strip():
+        return None
+
+    effort = str(raw_value).strip().lower()
+    if effort not in X_SEARCH_REASONING_EFFORTS:
+        allowed = ", ".join(X_SEARCH_REASONING_EFFORTS)
+        raise ValueError(
+            f"x_search.reasoning_effort must be one of: {allowed} "
+            f"(got {raw_value!r})"
+        )
+    return effort
 
 
 def _get_x_search_timeout_seconds() -> int:
@@ -93,8 +131,16 @@ def _resolve_xai_bearer() -> Tuple[str, str, str]:
     gate makes that case unreachable in normal operation, but the runtime
     check exists so a credential that expires between registration and
     invocation produces a clean tool error instead of a 401.
+
+    x_search is API-index access: when a subscription OAuth credential is
+    configured alongside a paid ``XAI_API_KEY``, the OAuth path authorizes
+    but answers ``/v1/responses`` in a degraded Grok explanatory mode with
+    no citations, while the API key returns real posts (#88040). Pass
+    ``prefer_api_key=True`` so the shared resolver checks the explicit API
+    key first — same root cause as the TTS fix for #87045 (#87081) —
+    keeping OAuth as the fallback when no API key is configured.
     """
-    creds = resolve_xai_http_credentials()
+    creds = resolve_xai_http_credentials(prefer_api_key=True)
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:
         raise RuntimeError(
@@ -134,6 +180,57 @@ def _normalize_handles(handles: Optional[List[str]], field_name: str) -> List[st
     if len(cleaned) > MAX_HANDLES:
         raise ValueError(f"{field_name} supports at most {MAX_HANDLES} handles")
     return cleaned
+
+
+def _parse_iso_date(value: str, field_name: str) -> date:
+    """Parse a strict YYYY-MM-DD string into a ``date``.
+
+    xAI accepts any string in the ``from_date``/``to_date`` slots and silently
+    returns an answer with no citations when the value is malformed or refers
+    to a window where no posts can exist. That behavior burns a billable API
+    call and produces a confident-sounding fluff answer that's hard for callers
+    to distinguish from a real result. Validating client-side fails fast and
+    gives the agent a clear error to act on.
+    """
+    raw = value.strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be YYYY-MM-DD (got {raw!r})"
+        ) from exc
+
+
+def _validate_date_range(from_date: str, to_date: str) -> None:
+    """Validate ``from_date`` / ``to_date`` before they reach xAI.
+
+    Rules:
+      * Either field, if non-empty, must parse as ``YYYY-MM-DD``.
+      * When both are set, ``from_date <= to_date``.
+      * ``from_date`` must not be later than today UTC — no posts can exist
+        in a window that hasn't started yet, so the call would be guaranteed
+        to return zero citations. ``to_date`` in the future is allowed
+        (callers may legitimately set "from yesterday to tomorrow").
+    """
+    parsed_from: Optional[date] = None
+    parsed_to: Optional[date] = None
+    if from_date.strip():
+        parsed_from = _parse_iso_date(from_date, "from_date")
+    if to_date.strip():
+        parsed_to = _parse_iso_date(to_date, "to_date")
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise ValueError(
+            f"from_date ({parsed_from.isoformat()}) must be on or before "
+            f"to_date ({parsed_to.isoformat()})"
+        )
+    if parsed_from is not None:
+        today_utc = datetime.now(timezone.utc).date()
+        if parsed_from > today_utc:
+            raise ValueError(
+                f"from_date ({parsed_from.isoformat()}) is in the future; "
+                f"X Search only indexes past posts (today UTC is "
+                f"{today_utc.isoformat()})"
+            )
 
 
 def _extract_response_text(payload: Dict[str, Any]) -> str:
@@ -225,6 +322,16 @@ def x_search_tool(
         if allowed and excluded:
             return tool_error("allowed_x_handles and excluded_x_handles cannot be used together")
 
+        try:
+            _validate_date_range(from_date, to_date)
+        except ValueError as exc:
+            return tool_error(str(exc))
+
+        try:
+            reasoning_effort = _get_x_search_reasoning_effort()
+        except ValueError as exc:
+            return tool_error(str(exc))
+
         tool_def: Dict[str, Any] = {"type": "x_search"}
         if allowed:
             tool_def["allowed_x_handles"] = allowed
@@ -250,6 +357,8 @@ def x_search_tool(
             "tools": [tool_def],
             "store": False,
         }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
 
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
@@ -299,6 +408,31 @@ def x_search_tool(
         citations = list(data.get("citations") or [])
         inline_citations = _extract_inline_citations(data)
 
+        # Degraded-result detection.
+        #
+        # xAI returns 200 OK with a synthesized answer even when its X index
+        # has no posts matching the caller's narrowing filters. The answer
+        # then comes from the model's training data, which is misleading
+        # because it looks identical to a real, citation-backed result. When
+        # any narrowing filter is active AND both citation channels came back
+        # empty, mark the response as degraded so callers can decide to
+        # broaden filters, retry, or fall back to a different source.
+        active_filters: List[str] = []
+        if allowed:
+            active_filters.append("allowed_x_handles")
+        if excluded:
+            active_filters.append("excluded_x_handles")
+        if from_date.strip():
+            active_filters.append("from_date")
+        if to_date.strip():
+            active_filters.append("to_date")
+        degraded = bool(active_filters) and not citations and not inline_citations
+        degraded_reason = (
+            f"no citations returned despite filters: {', '.join(active_filters)}"
+            if degraded
+            else None
+        )
+
         return json.dumps(
             {
                 "success": True,
@@ -310,6 +444,8 @@ def x_search_tool(
                 "answer": answer,
                 "citations": citations,
                 "inline_citations": inline_citations,
+                "degraded": degraded,
+                "degraded_reason": degraded_reason,
             },
             ensure_ascii=False,
         )
@@ -355,9 +491,12 @@ X_SEARCH_SCHEMA = {
     "name": "x_search",
     "description": (
         "Search X (Twitter) posts, profiles, and threads using xAI's built-in "
-        "X Search tool. Use this for current discussion, reactions, or claims "
-        "on X rather than general web pages. Available when xAI credentials "
-        "are configured (SuperGrok OAuth or XAI_API_KEY)."
+        "X Search tool. Read-only discovery only: use this for current "
+        "discussion, reactions, or claims on public X rather than general web "
+        "pages. Do not use it to post, reply, like, DM, upload media, delete, "
+        "or inspect the user's authenticated X account — those require a "
+        "separate authenticated X API surface outside this tool. Available "
+        "when xAI credentials are configured (SuperGrok OAuth or XAI_API_KEY)."
     ),
     "parameters": {
         "type": "object",
