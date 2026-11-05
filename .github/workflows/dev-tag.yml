@@ -23,6 +23,7 @@
 name: dev tag
 
 "on":
+  workflow_dispatch:
   push:
     tags:
       # Anchored whole-ref match: cannot match a bare vX.Y.Z, -stg.N or -rc.N.
