@@ -13,6 +13,7 @@ early (#97905; single-profile sibling report #88220).
 The invariant pinned here: ``next_run_at`` written during a foreign-process
 tick carries the JOB-OWNING profile's configured UTC offset.
 """
+
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -30,18 +31,14 @@ def _fresh_tz_cache(monkeypatch):
     hermes_time.reset_cache()
 
 
-def test_foreign_process_tick_persists_owning_profile_offset(
-    tmp_path, monkeypatch
-):
+def test_foreign_process_tick_persists_owning_profile_offset(tmp_path, monkeypatch):
     """next_run_at persisted during a multiplex tick uses the ticked
     profile's timezone, not the backend process's."""
     backend_home = tmp_path / "backend"  # desktop backend's own profile: UTC
     profile_a = tmp_path / "north-caribbean"  # job-owning profile: Eastern
     backend_home.mkdir()
     profile_a.mkdir()
-    (backend_home / "config.yaml").write_text(
-        "timezone: UTC\n", encoding="utf-8"
-    )
+    (backend_home / "config.yaml").write_text("timezone: UTC\n", encoding="utf-8")
     (profile_a / "config.yaml").write_text(
         "timezone: America/New_York\n", encoding="utf-8"
     )
@@ -49,9 +46,7 @@ def test_foreign_process_tick_persists_owning_profile_offset(
     monkeypatch.setenv("HERMES_HOME", str(backend_home))
 
     # Backend process resolves its own timezone first (process startup).
-    assert hermes_time.now().utcoffset() == datetime.now(
-        ZoneInfo("UTC")
-    ).utcoffset()
+    assert hermes_time.now().utcoffset() == datetime.now(ZoneInfo("UTC")).utcoffset()
 
     from hermes_constants import (
         reset_hermes_home_override,
@@ -78,3 +73,31 @@ def test_foreign_process_tick_persists_owning_profile_offset(
     )
     # And the wall clock honors the cron expression in the profile's zone.
     assert (next_run.hour, next_run.minute) == (14, 0)
+
+
+@pytest.mark.parametrize(
+    "last_run, expected",
+    [
+        ("2026-10-23T15:03:05+01:00", "2026-10-30T15:00:00+00:00"),
+        ("2027-03-26T15:03:05+00:00", "2027-04-02T15:00:00+01:00"),
+    ],
+)
+def test_weekly_job_keeps_wall_clock_and_fires_across_dst(
+    tmp_path, monkeypatch, last_run, expected
+):
+    import cron.jobs
+
+    (tmp_path / "config.yaml").write_text("timezone: Europe/London\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    london = ZoneInfo("Europe/London")
+    base = datetime.fromisoformat(last_run).astimezone(london)
+    monkeypatch.setattr(cron.jobs, "_hermes_now", lambda: base)
+    schedule = {"kind": "cron", "expr": "0 15 * * 5"}
+
+    assert cron.jobs.compute_next_run(schedule, last_run) == expected
+    job = cron.jobs.create_job(prompt="Weekly report", schedule="0 15 * * 5")
+    assert job["next_run_at"] == expected
+
+    due_at = datetime.fromisoformat(expected).astimezone(london)
+    monkeypatch.setattr(cron.jobs, "_hermes_now", lambda: due_at)
+    assert job["id"] in [item["id"] for item in cron.jobs.get_due_jobs()]
